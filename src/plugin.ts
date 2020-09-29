@@ -101,6 +101,8 @@ export interface Callback {
   missing?: string;
 }
 
+export type Exclude = (request: Request) => boolean;
+
 const getInnerRequest: getInnerRequest = require("enhanced-resolve/lib/getInnerRequest");
 
 export class TsconfigPathsPlugin implements ResolverPlugin {
@@ -113,8 +115,15 @@ export class TsconfigPathsPlugin implements ResolverPlugin {
   extensions: ReadonlyArray<string>;
 
   matchPath: TsconfigPaths.MatchPathAsync;
+  exclude?: Exclude;
 
-  constructor(rawOptions: Partial<Options.Options> = {}) {
+  constructor(
+    rawOptions: Partial<
+      Options.Options & {
+        readonly exclude: Exclude | RegExp | string;
+      }
+    > = {}
+  ) {
     this.source = "described-resolve";
     this.target = "resolve";
 
@@ -133,9 +142,7 @@ export class TsconfigPathsPlugin implements ResolverPlugin {
       this.log.logError(`Failed to load ${loadFrom}: ${loadResult.message}`);
     } else {
       this.log.logInfo(
-        `tsconfig-paths-webpack-plugin: Using config file at ${
-          loadResult.configFileAbsolutePath
-        }`
+        `tsconfig-paths-webpack-plugin: Using config file at ${loadResult.configFileAbsolutePath}`
       );
       this.baseUrl = options.baseUrl || loadResult.baseUrl;
       this.absoluteBaseUrl = options.baseUrl
@@ -146,11 +153,22 @@ export class TsconfigPathsPlugin implements ResolverPlugin {
         loadResult.paths,
         options.mainFields
       );
+      const { exclude } = rawOptions;
+      if (exclude) {
+        let reg: unknown = exclude;
+        if (typeof exclude === "string") {
+          reg = new RegExp(exclude);
+        }
+        this.exclude =
+          typeof exclude === "function"
+            ? exclude
+            : (request: Request) => !!request.path.match(reg as RegExp);
+      }
     }
   }
 
   apply(resolver: Resolver): void {
-    const { baseUrl } = this;
+    const { baseUrl, exclude } = this;
 
     if (!baseUrl) {
       // Nothing to do if there is no baseUrl
@@ -174,30 +192,45 @@ export class TsconfigPathsPlugin implements ResolverPlugin {
 
     // getHook will only exist in Webpack 4, if so we should comply to the Webpack 4 plugin system.
     if (resolver.getHook && typeof resolver.getHook === "function") {
+      const originalPluginCallback = createPluginCallback(
+        this.matchPath,
+        resolver,
+        this.absoluteBaseUrl,
+        resolver.getHook(this.target),
+        this.extensions
+      );
+      const pluginCallback =
+        exclude !== undefined
+          ? (
+              request: Request,
+              resolveContext: ResolveContext,
+              callback: Callback
+            ) => {
+              return exclude(request) === true
+                ? callback()
+                : originalPluginCallback(request, resolveContext, callback);
+            }
+          : originalPluginCallback;
       resolver
         .getHook(this.source)
-        .tapAsync(
-          { name: "TsconfigPathsPlugin" },
-          createPluginCallback(
-            this.matchPath,
-            resolver,
-            this.absoluteBaseUrl,
-            resolver.getHook(this.target),
-            this.extensions
-          )
-        );
+        .tapAsync({ name: "TsconfigPathsPlugin" }, pluginCallback);
     } else {
       // This is the legacy (Webpack < 4.0.0) way of using the plugin system.
-      resolver.plugin(
-        this.source,
-        createPluginLegacy(
-          this.matchPath,
-          resolver,
-          this.absoluteBaseUrl,
-          this.target,
-          this.extensions
-        )
+      const originalPluginCallback = createPluginLegacy(
+        this.matchPath,
+        resolver,
+        this.absoluteBaseUrl,
+        this.target,
+        this.extensions
       );
+      const pluginCallback = exclude
+        ? (request: Request, callback: Callback) => {
+            return exclude(request) === true
+              ? callback()
+              : originalPluginCallback(request, callback);
+          }
+        : originalPluginCallback;
+      resolver.plugin(this.source, pluginCallback);
     }
   }
 }
@@ -220,7 +253,8 @@ function createPluginCallback(
 
     if (
       !innerRequest ||
-      (innerRequest.startsWith(".") || innerRequest.startsWith(".."))
+      innerRequest.startsWith(".") ||
+      innerRequest.startsWith("..")
     ) {
       return callback();
     }
@@ -242,7 +276,7 @@ function createPluginCallback(
         const newRequest = {
           ...request,
           request: foundMatch,
-          path: absoluteBaseUrl
+          path: absoluteBaseUrl,
         };
 
         // Only at this point we are sure we are dealing with the latest Webpack version (>= 4.0.0)
@@ -253,7 +287,7 @@ function createPluginCallback(
         return (resolver.doResolve as doResolve)(
           hook,
           newRequest,
-          `Resolved request '${innerRequest}' to '${foundMatch}' using tsconfig.json paths mapping`,
+          `Resolved request "${innerRequest}" to "${foundMatch}" using tsconfig.json paths mapping`,
           createInnerContext({ ...resolveContext }),
           (err2: Error, result2: string): void => {
             // Pattern taken from:
@@ -289,7 +323,8 @@ function createPluginLegacy(
 
     if (
       !innerRequest ||
-      (innerRequest.startsWith(".") || innerRequest.startsWith(".."))
+      innerRequest.startsWith(".") ||
+      innerRequest.startsWith("..")
     ) {
       return callback();
     }
@@ -311,7 +346,7 @@ function createPluginLegacy(
         const newRequest = {
           ...request,
           request: foundMatch,
-          path: absoluteBaseUrl
+          path: absoluteBaseUrl,
         };
 
         // Only at this point we are sure we are dealing with a legacy Webpack version (< 4.0.0)
@@ -322,8 +357,8 @@ function createPluginLegacy(
         return (resolver.doResolve as doResolveLegacy)(
           target,
           newRequest,
-          `Resolved request '${innerRequest}' to '${foundMatch}' using tsconfig.json paths mapping`,
-          createInnerCallback(function(err2: Error, result2: string): void {
+          `Resolved request "${innerRequest}" to "${foundMatch}" using tsconfig.json paths mapping`,
+          createInnerCallback(function (err2: Error, result2: string): void {
             // Note:
             //  *NOT* using an arrow function here because arguments.length implies we have "this"
             //  That means "this" has to be in the current function scope, and not the scope above.
